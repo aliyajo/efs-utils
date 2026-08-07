@@ -60,7 +60,7 @@ Refer to the official [Go documentation](https://go.dev/doc/install) for detaile
 
 ## GCC Version Requirements
 
-**For distributions with GCC 14 or later (Debian 13, Fedora 41/42, RHEL 10, openSUSE Tumbleweed):**
+**For distributions with GCC 14 or later (Debian 13, Fedora 41/42, RHEL 10, openSUSE Tumbleweed, openSUSE Leap 16):**
 
 The AWS-LC FIPS module requires GCC version 13 or earlier. If your distribution uses GCC 14 or later by default, you'll need to use GCC 13 instead. If package manager does not provide GCC version 13 or earlier, follow [instruction](https://gcc.gnu.org/install/) to install desired version of GCC.
 
