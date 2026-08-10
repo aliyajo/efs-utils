@@ -891,10 +891,15 @@ def get_pid_in_state_dir(state_file, state_file_dir):
     state_dir_pid_path = os.path.join(
         state_file_dir, state_file + "+", STUNNEL_PID_FILE
     )
-    if os.path.exists(state_dir_pid_path):
+    # Open directly rather than checking os.path.exists() first: under high mount
+    # churn the mount's own unmount teardown can delete this pid file between the
+    # existence check and the open, and the resulting FileNotFoundError would crash
+    # the watchdog. Letting open() answer "does it exist" atomically avoids that race.
+    try:
         with open(state_dir_pid_path) as f:
             return f.read()
-    return None
+    except FileNotFoundError:
+        return None
 
 
 def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
