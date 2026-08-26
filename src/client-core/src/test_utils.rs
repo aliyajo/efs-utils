@@ -21,7 +21,7 @@ pub fn get_test_config() -> ProxyConfig {
 /// Used by readahead cache and file readahead state tests.
 #[derive(Clone)]
 pub struct CountingS3DataReader {
-    pub call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub call_count: crate::sync::Arc<crate::sync::atomic::AtomicU64>,
 }
 
 impl Default for CountingS3DataReader {
@@ -33,12 +33,12 @@ impl Default for CountingS3DataReader {
 impl CountingS3DataReader {
     pub fn new() -> Self {
         Self {
-            call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            call_count: crate::sync::Arc::new(crate::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     pub fn calls(&self) -> u64 {
-        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+        self.call_count.load(crate::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -47,10 +47,10 @@ impl S3DataReader for CountingS3DataReader {
     async fn spawn_read_task(
         &self,
         s3_data_locator: awsfile_bypass_data_locator,
-        _read_bypass_context: std::sync::Arc<ReadBypassContext>,
+        _read_bypass_context: crate::sync::Arc<ReadBypassContext>,
     ) -> tokio::task::JoinHandle<Result<bytes::Bytes, crate::aws::s3_client::S3ClientError>> {
         self.call_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
         let count = s3_data_locator.count as usize;
         let offset = s3_data_locator.offset;
         tokio::spawn(async move {
@@ -59,6 +59,26 @@ impl S3DataReader for CountingS3DataReader {
                 .collect();
             Ok(bytes::Bytes::from(data))
         })
+    }
+}
+
+/// Mock S3DataReader whose reads always fail with a fixed error class. Used to verify
+/// the class survives the readahead cache's error plumbing instead of being flattened
+/// into an opaque cache-error message.
+#[derive(Clone)]
+pub struct FailingS3DataReader {
+    pub make_error: fn() -> crate::aws::s3_client::S3ClientError,
+}
+
+#[async_trait::async_trait]
+impl S3DataReader for FailingS3DataReader {
+    async fn spawn_read_task(
+        &self,
+        _s3_data_locator: awsfile_bypass_data_locator,
+        _read_bypass_context: crate::sync::Arc<ReadBypassContext>,
+    ) -> tokio::task::JoinHandle<Result<bytes::Bytes, crate::aws::s3_client::S3ClientError>> {
+        let make_error = self.make_error;
+        tokio::spawn(async move { Err(make_error()) })
     }
 }
 
@@ -77,7 +97,7 @@ pub fn create_test_s3_data_locator(offset: u64, count: u32) -> awsfile_bypass_da
 /// (not `test-util`) because `aws_smithy_mocks` is a dev-dependency; external
 /// consumers construct their own contexts via `ReadBypassContext::default()`.
 #[cfg(test)]
-pub async fn create_test_read_bypass_context() -> std::sync::Arc<ReadBypassContext> {
+pub async fn create_test_read_bypass_context() -> crate::sync::Arc<ReadBypassContext> {
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_smithy_mocks::{mock, mock_client};
@@ -92,13 +112,13 @@ pub async fn create_test_read_bypass_context() -> std::sync::Arc<ReadBypassConte
                 .build()
         });
 
-    let mock_client = std::sync::Arc::new(mock_client!(aws_sdk_s3, [&get_object_rule]));
+    let mock_client = crate::sync::Arc::new(mock_client!(aws_sdk_s3, [&get_object_rule]));
     let s3_client =
         crate::aws::s3_client::S3Client::new_with_client("test-bucket", "test-prefix", mock_client)
             .await;
 
     let proxy_config = ProxyConfig::default();
-    std::sync::Arc::new(ReadBypassContext::new(
+    crate::sync::Arc::new(ReadBypassContext::new(
         &proxy_config,
         "test-bucket".to_string(),
         "test-prefix".to_string(),

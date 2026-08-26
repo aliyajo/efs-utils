@@ -2,6 +2,7 @@
 //! Auxiliary abstraction level between ReadBypassAgent and S3Client.
 //!
 
+use crate::sync::Arc;
 use crate::{
     aws::s3_client::S3ClientError, nfs::nfs4_1_xdr::awsfile_bypass_data_locator,
     util::read_bypass_context::ReadBypassContext,
@@ -10,7 +11,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dyn_clone::{clone_trait_object, DynClone};
 use log::warn;
-use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -90,8 +90,8 @@ impl S3DataReader for S3ReadBypassReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::atomic::{AtomicUsize, Ordering};
     use crate::util::read_bypass_context::ReadBypassContext;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     fn create_test_locator() -> awsfile_bypass_data_locator {

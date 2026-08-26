@@ -11,7 +11,7 @@ import os
 import pwd
 import re
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 AMAZON_LINUX_2_RELEASE_ID = "Amazon Linux release 2 (Karoo)"
 AMAZON_LINUX_2_PRETTY_NAME = "Amazon Linux 2"
@@ -146,7 +146,7 @@ UNSUPPORTED_OPTIONS = ["capath"]
 
 WATCHDOG_SERVICE = "amazon-efs-mount-watchdog"
 # MacOS instances use plist files. This files needs to be loaded on launchctl (init system of MacOS)
-WATCHDOG_SERVICE_PLIST_PATH = "/Library/LaunchAgents/amazon-efs-mount-watchdog.plist"
+WATCHDOG_SERVICE_PLIST_PATH = "/Library/LaunchDaemons/amazon-efs-mount-watchdog.plist"
 SYSTEM_RELEASE_PATH = "/etc/system-release"
 OS_RELEASE_PATH = "/etc/os-release"
 MACOS_BIG_SUR_RELEASE = "macOS-11"

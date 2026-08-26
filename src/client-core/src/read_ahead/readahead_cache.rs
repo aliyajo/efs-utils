@@ -8,12 +8,12 @@
 //! This file contains the top-level FileReadAheadCache which manages the collection of file states
 //! and provides the main interface for the readahead system.
 
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, Mutex, Weak};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::RwLock;
 
 use crate::config_parser::ReadBypassConfig;
@@ -21,7 +21,7 @@ use crate::ctx_debug;
 use crate::memory::memory_pool::{MemoryPool, MemoryPoolConfig};
 use crate::nfs::nfs4_1_xdr::{awsfile_bypass_data_locator, nfs_fh4};
 use crate::read_ahead::cached_data::get_current_time_ms;
-use crate::read_ahead::error::ReadAheadCacheError;
+use crate::read_ahead::error::{ReadAheadCacheError, ReadAheadError};
 use crate::read_ahead::file_readahead_state::{FileReadAheadState, LruKey, LruValue};
 use crate::util::read_bypass_request_context::ReadBypassRequestContext;
 use crate::util::s3_data_reader::S3DataReader;
@@ -114,7 +114,7 @@ impl FileReadAheadCache {
         filehandle: nfs_fh4,
         file_size: u64,
         s3_data_locator: awsfile_bypass_data_locator,
-    ) -> Result<Option<Bytes>, ReadAheadCacheError> {
+    ) -> Result<Option<Bytes>, ReadAheadError> {
         // Skip cache for small files that fit within a single S3 chunk read
         if file_size <= self.small_file_caching_threshold
             && s3_data_locator.count as u64 == file_size
@@ -171,7 +171,7 @@ impl FileReadAheadCache {
         &self,
         read_bypass_request_context: Arc<ReadBypassRequestContext>,
         s3_data_locator: awsfile_bypass_data_locator,
-    ) -> Result<Option<Bytes>, ReadAheadCacheError> {
+    ) -> Result<Option<Bytes>, ReadAheadError> {
         let read_task = self
             .s3_data_reader
             .spawn_read_task(
@@ -179,14 +179,10 @@ impl FileReadAheadCache {
                 read_bypass_request_context.read_bypass_context.clone(),
             )
             .await;
-        let data = read_task
-            .await
-            .map_err(|e| ReadAheadCacheError {
-                message: format!("Direct S3 read join error: {}", e),
-            })?
-            .map_err(|e| ReadAheadCacheError {
-                message: format!("Direct S3 read error: {:?}", e),
-            })?;
+        // The inner `?` keeps the S3 error class in `ReadAheadError::s3_error`.
+        let data = read_task.await.map_err(|e| {
+            ReadAheadCacheError::Other(format!("Direct S3 read join error: {}", e))
+        })??;
         Ok(Some(data))
     }
 
@@ -343,11 +339,23 @@ impl FileReadAheadCache {
         let mut stale_removed = 0;
         let mut empty_files = Vec::new();
 
+        // Snapshot the entries before awaiting. Holding the DashMap shard
+        // iterator across an .await is a lock-held-across-await hazard: the
+        // shard read lock blocks all writers to that shard for the duration
+        // of the awaited cleanup, and if a task on the same worker thread
+        // mutates the map at the suspension point it can deadlock (see the
+        // "Locking behaviour" notes on DashMap's mutating methods).
+        let entries: Vec<_> = self
+            .file_states
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+
         // First pass: cleanup stale entries and identify empty files
-        for entry in self.file_states.iter() {
-            stale_removed += entry.value().cleanup_stale_entries(IDLE_TTL_MS).await;
-            if entry.value().is_empty() {
-                empty_files.push(entry.key().clone());
+        for (key, state) in entries {
+            stale_removed += state.cleanup_stale_entries(IDLE_TTL_MS).await;
+            if state.is_empty() {
+                empty_files.push(key);
             }
         }
 
@@ -414,13 +422,15 @@ impl FileReadAheadCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aws::s3_client::S3ClientError;
     use crate::nfs::nfs4_1_xdr::nfs_fh4;
+    use crate::sync::atomic::Ordering;
     use crate::test_utils::{
         create_test_read_bypass_context, create_test_s3_data_locator, CountingS3DataReader,
+        FailingS3DataReader,
     };
     use crate::util::read_bypass_request_context::ReadBypassRequestContext;
     use crate::util::s3_data_reader::S3ReadBypassReader;
-    use std::sync::atomic::Ordering;
     use test_case::test_case;
 
     #[tokio::test]
@@ -992,6 +1002,76 @@ mod tests {
             cache.get_num_files(),
             1,
             "Should create cache state for large file"
+        );
+    }
+
+    async fn read_with_failing_s3(
+        make_error: fn() -> S3ClientError,
+        file_size: u64,
+        count: u32,
+    ) -> ReadAheadError {
+        let cache = Arc::new(FileReadAheadCache::new(
+            64 * 1024,
+            64 * 1024,
+            Arc::new(FailingS3DataReader { make_error }),
+            &ReadBypassConfig::default(),
+        ));
+        cache.set_self_weak(Arc::downgrade(&cache));
+
+        let read_bypass_context =
+            Arc::new(crate::util::read_bypass_context::ReadBypassContext::default().await);
+        let ctx = Arc::new(
+            crate::util::read_bypass_request_context::ReadBypassRequestContext::new(
+                read_bypass_context,
+                0,
+            ),
+        );
+
+        cache
+            .process_read_request(
+                ctx,
+                crate::nfs::nfs4_1_xdr::nfs_fh4(b"failing_fh".to_vec()),
+                file_size,
+                create_test_locator(0, count),
+            )
+            .await
+            .expect_err("Read should fail when S3 fails")
+    }
+
+    /// Small-file path (direct read, no cache state): the S3 error class must reach the caller.
+    #[tokio::test]
+    async fn test_direct_read_propagates_s3_error_class() {
+        // 512B <= default small_file_caching_threshold (1 MiB), so this takes the direct path.
+        let error = read_with_failing_s3(|| S3ClientError::Throttled, 512, 512).await;
+        assert!(
+            matches!(error.s3_error, Some(S3ClientError::Throttled)),
+            "Direct read should surface the S3 error class, got {error:?}"
+        );
+
+        let error = read_with_failing_s3(|| S3ClientError::AccessDenied, 512, 512).await;
+        assert!(
+            matches!(error.s3_error, Some(S3ClientError::AccessDenied)),
+            "Direct read should not rewrite the S3 error class, got {error:?}"
+        );
+    }
+
+    /// Cached path (the default production path): the S3 error class must reach the caller too,
+    /// otherwise a throttled GET is indistinguishable from a permanent cache failure and the
+    /// read bypass agent denylists the file handle for the full denylist TTL.
+    #[tokio::test]
+    async fn test_cached_read_propagates_s3_error_class() {
+        // 2 MiB > default small_file_caching_threshold (1 MiB), so this goes through the cache.
+        let file_size = 2 * 1024 * 1024u64;
+        let error = read_with_failing_s3(|| S3ClientError::Throttled, file_size, 8192).await;
+        assert!(
+            matches!(error.s3_error, Some(S3ClientError::Throttled)),
+            "Cached read should surface the S3 error class, got {error:?}"
+        );
+
+        let error = read_with_failing_s3(|| S3ClientError::AccessDenied, file_size, 8192).await;
+        assert!(
+            matches!(error.s3_error, Some(S3ClientError::AccessDenied)),
+            "Cached read should not rewrite the S3 error class, got {error:?}"
         );
     }
 

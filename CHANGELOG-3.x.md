@@ -1,3 +1,7 @@
+# v3.3.1
+- Schedule TLS cert refresh from credential expiration
+- Don't denylist file handles for transient S3 errors on readbypass path
+
 # v3.3.0
 - Eliminate unnecessary data copies on the readbypass path
 - Consolidating dependencies

@@ -6,25 +6,26 @@
 //! mutex lock.
 //!
 
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, Mutex, Weak};
 use bytes::{Bytes, BytesMut};
 use log::{error, trace};
 use lru::LruCache;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::aws::s3_client::S3ClientError;
 use crate::memory::memory_pool::{self, MemoryChunk, MemoryPool};
 use crate::nfs::nfs4_1_xdr::awsfile_bypass_data_locator;
 use crate::read_ahead::cached_data::{
     get_current_time_ms, CacheEntryState, CachedData, INVALID_U64,
 };
-use crate::read_ahead::error::ReadAheadCacheError;
+use crate::read_ahead::error::{ReadAheadCacheError, ReadAheadError};
 use crate::read_ahead::readahead_cache::FileReadAheadCache;
 use crate::util::read_bypass_request_context::ReadBypassRequestContext;
 use crate::util::s3_data_reader::S3DataReader;
-use crate::{ctx_debug, ctx_error, ctx_warn};
+use crate::{ctx_debug, ctx_error, ctx_trace, ctx_warn};
 
 /// Minimum time (ms) after loading before an entry can be evicted, protects
 // recently loaded items from being immediately evictedx
@@ -173,21 +174,17 @@ impl FileReadAheadState {
         s3_data_locator: &awsfile_bypass_data_locator,
     ) -> Result<(), ReadAheadCacheError> {
         if s3_data_locator.s3_key != self.s3_key {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "S3 key mismatch: expected {:?}, got {:?}",
-                    self.s3_key, s3_data_locator.s3_key
-                ),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "S3 key mismatch: expected {:?}, got {:?}",
+                self.s3_key, s3_data_locator.s3_key
+            )));
         }
 
         if s3_data_locator.etag != self.s3_etag {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "S3 etag mismatch: expected {:?}, got {:?}",
-                    self.s3_etag, s3_data_locator.etag
-                ),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "S3 etag mismatch: expected {:?}, got {:?}",
+                self.s3_etag, s3_data_locator.etag
+            )));
         }
 
         Ok(())
@@ -203,7 +200,7 @@ impl FileReadAheadState {
         file_size: u64,
         s3_data_reader: Arc<dyn S3DataReader>,
         suppress_readahead: bool,
-    ) -> Result<(Option<Bytes>, bool), ReadAheadCacheError> {
+    ) -> Result<(Option<Bytes>, bool), ReadAheadError> {
         // === STEP 1: Validate range ===
         // Clamp to file size - NFS allows reads past EOF but we return data up to EOF only
         let end = (s3_data_locator.offset + s3_data_locator.count as u64).min(file_size);
@@ -314,7 +311,7 @@ impl FileReadAheadState {
         s3_data_reader: Arc<dyn S3DataReader>,
         range: Range<u64>,
         read_pattern: ReadPattern,
-    ) -> Result<(Option<Bytes>, bool), ReadAheadCacheError> {
+    ) -> Result<(Option<Bytes>, bool), ReadAheadError> {
         self.validate_request(s3_data_locator)?;
 
         // === STEP 1: Atomic planning
@@ -351,9 +348,11 @@ impl FileReadAheadState {
                     for prev_range in &missing_ranges[..i] {
                         data_cache_write.remove(&prev_range.start);
                     }
-                    return Err(ReadAheadCacheError {
-                        message: format!("Failed to insert missing range: {:?}", missing_range),
-                    });
+                    return Err(ReadAheadCacheError::Other(format!(
+                        "Failed to insert missing range: {:?}",
+                        missing_range
+                    ))
+                    .into());
                 }
             }
 
@@ -382,7 +381,7 @@ impl FileReadAheadState {
                     self.remove_failed_entry(missing_range.start, CacheEntryState::Failed)
                         .await;
                 }
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -611,12 +610,10 @@ impl FileReadAheadState {
         data_cache: &mut RwLockWriteGuard<'_, BTreeMap<u64, (u64, Arc<CachedData>)>>,
     ) -> Result<bool, ReadAheadCacheError> {
         if range.start >= range.end {
-            let error = ReadAheadCacheError {
-                message: format!(
-                    "Invalid range: start ({}) must be less than end ({})",
-                    range.start, range.end
-                ),
-            };
+            let error = ReadAheadCacheError::Other(format!(
+                "Invalid range: start ({}) must be less than end ({})",
+                range.start, range.end
+            ));
             error!("{}", error);
             return Err(error);
         }
@@ -643,12 +640,10 @@ impl FileReadAheadState {
         T: std::ops::Deref<Target = BTreeMap<u64, (u64, Arc<CachedData>)>>,
     {
         if requested_range.start >= requested_range.end {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "Invalid range: start ({}) must be less than end ({})",
-                    requested_range.start, requested_range.end
-                ),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "Invalid range: start ({}) must be less than end ({})",
+                requested_range.start, requested_range.end
+            )));
         }
 
         let mut ranges_to_fetch: Vec<(Range<u64>, u64, u64, Arc<CachedData>)> = Vec::new();
@@ -740,9 +735,10 @@ impl FileReadAheadState {
         expected: Range<u64>,
     ) -> Result<Bytes, ReadAheadCacheError> {
         if ranges.is_empty() {
-            return Err(ReadAheadCacheError {
-                message: format!("No data for range {}..{}", expected.start, expected.end),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "No data for range {}..{}",
+                expected.start, expected.end
+            )));
         }
 
         // Fast path: a single range fully covering the request is served as a zero-copy view
@@ -770,20 +766,16 @@ impl FileReadAheadState {
                 continue; // Range entirely before current position
             }
             if range.start < pos && pos != expected.start {
-                return Err(ReadAheadCacheError {
-                    message: format!(
+                return Err(ReadAheadCacheError::Other(format!(
                         "Overlapping ranges detected: current position {} but range starts at {} (range end: {})",
                         pos, range.start, range.end
-                    ),
-                });
+                    )));
             }
             if range.start > pos {
-                return Err(ReadAheadCacheError {
-                    message: format!(
-                        "Gap in data at offset {}, next range starts at {} (expected end: {})",
-                        pos, range.start, expected.end
-                    ),
-                });
+                return Err(ReadAheadCacheError::Other(format!(
+                    "Gap in data at offset {}, next range starts at {} (expected end: {})",
+                    pos, range.start, expected.end
+                )));
             }
             pos = range.end;
             if pos >= expected.end {
@@ -791,9 +783,10 @@ impl FileReadAheadState {
             }
         }
         if pos < expected.end {
-            return Err(ReadAheadCacheError {
-                message: format!("Data ends at {} but expected {}", pos, expected.end),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "Data ends at {} but expected {}",
+                pos, expected.end
+            )));
         }
 
         // Extract just the expected range
@@ -813,16 +806,14 @@ impl FileReadAheadState {
 
         // Final sanity check - result must be exactly the expected size
         if result.len() != expected_len {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "Result size mismatch for range {}..{}: got {} bytes but expected {} \
+            return Err(ReadAheadCacheError::Other(format!(
+                "Result size mismatch for range {}..{}: got {} bytes but expected {} \
                     (possible overlap or gap in cached/fetched ranges)",
-                    expected.start,
-                    expected.end,
-                    result.len(),
-                    expected_len
-                ),
-            });
+                expected.start,
+                expected.end,
+                result.len(),
+                expected_len
+            )));
         }
 
         Ok(result.freeze())
@@ -905,7 +896,7 @@ impl FileReadAheadState {
         original_request_range: Range<u64>,
         s3_data_reader: &dyn S3DataReader,
         s3_data_locator: &awsfile_bypass_data_locator,
-    ) -> Result<(Vec<(Range<u64>, Bytes)>, bool), ReadAheadCacheError> {
+    ) -> Result<(Vec<(Range<u64>, Bytes)>, bool), ReadAheadError> {
         ctx_debug!(
             read_bypass_request_context,
             "Fetching {} missing ranges from S3",
@@ -939,6 +930,8 @@ impl FileReadAheadState {
         }
 
         let mut required_failed = false;
+        // Keep the first S3 error that failed a required range.
+        let mut required_s3_error: Option<S3ClientError> = None;
         let mut any_required_cache_failed = false;
         let mut all_required_data: Vec<(Range<u64>, Bytes)> = Vec::new();
 
@@ -962,23 +955,39 @@ impl FileReadAheadState {
                             ctx_warn!(
                                 read_bypass_request_context,
                                 "Caching failed ({}), will return data directly",
-                                e.message
+                                e
                             );
                             any_required_cache_failed = true;
                         }
                     }
                 }
                 Ok(Err(s3_error)) => {
-                    // S3 failure - use Failed so file gets denylisted
+                    // S3 failure - drop the entry so waiters stop blocking on it.
                     self.remove_failed_entry(missing_range.start, CacheEntryState::Failed)
                         .await;
                     if is_required {
-                        ctx_error!(
+                        // Throttling is reported once by the caller that decides to retry it.
+                        if matches!(s3_error, S3ClientError::Throttled) {
+                            ctx_trace!(
+                                read_bypass_request_context,
+                                "Required S3 read throttled: {:?}",
+                                s3_error
+                            );
+                        } else {
+                            ctx_error!(
+                                read_bypass_request_context,
+                                "Required S3 read failed: {:?}",
+                                s3_error
+                            );
+                        }
+                        required_failed = true;
+                        required_s3_error.get_or_insert(s3_error);
+                    } else if matches!(s3_error, S3ClientError::Throttled) {
+                        ctx_trace!(
                             read_bypass_request_context,
-                            "Required S3 read failed: {:?}",
+                            "Readahead S3 read throttled (non-critical): {:?}",
                             s3_error
                         );
-                        required_failed = true;
                     } else {
                         ctx_warn!(
                             read_bypass_request_context,
@@ -1010,8 +1019,9 @@ impl FileReadAheadState {
         }
 
         if required_failed {
-            return Err(ReadAheadCacheError {
-                message: "Required S3 read failed".to_string(),
+            return Err(match required_s3_error {
+                Some(s3_error) => s3_error.into(),
+                None => ReadAheadCacheError::Other("Required S3 read failed".to_string()).into(),
             });
         }
 
@@ -1056,8 +1066,8 @@ impl FileReadAheadState {
                 .map(|(_, cached_data)| cached_data.clone())
         };
 
-        let cached_data = cached_data.ok_or_else(|| ReadAheadCacheError {
-            message: format!("Cached range not found for offset {}", range.start),
+        let cached_data = cached_data.ok_or_else(|| {
+            ReadAheadCacheError::Other(format!("Cached range not found for offset {}", range.start))
         })?;
 
         let chunks = self.prepare_chunks_from_bytes(range, s3_data).await?;
@@ -1073,13 +1083,11 @@ impl FileReadAheadState {
         let size = range.end - range.start;
 
         if size != s3_data.len() as u64 {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "Size mismatch: requested range size ({}) != bytes_to_write length ({})",
-                    size,
-                    s3_data.len()
-                ),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "Size mismatch: requested range size ({}) != bytes_to_write length ({})",
+                size,
+                s3_data.len()
+            )));
         }
 
         let chunk_size_u64 = memory_pool::CHUNK_SIZE as u64;
@@ -1094,18 +1102,14 @@ impl FileReadAheadState {
 
         // If still over capacity, fail and let caller handle gracefully
         if self.memory_pool.would_exceed_capacity(num_chunks) {
-            return Err(ReadAheadCacheError {
-                message: "Memory pool at capacity".to_string(),
-            });
+            return Err(ReadAheadCacheError::MemoryPoolAtCapacity);
         }
 
         let mut chunks = self.memory_pool.consume(num_chunks);
 
         // Race condition: another thread may have allocated between our check and consume
         if chunks.len() < num_chunks {
-            return Err(ReadAheadCacheError {
-                message: "Memory pool at capacity".to_string(),
-            });
+            return Err(ReadAheadCacheError::MemoryPoolAtCapacity);
         }
 
         // Copy data into chunks
@@ -1315,8 +1319,8 @@ mod tests {
     use super::*;
     use crate::config_parser::ProxyConfig;
     use crate::memory::memory_pool::{MemoryPoolConfig, CHUNK_SIZE};
+    use crate::sync::Arc;
     use crate::util::read_bypass_context::ReadBypassContext;
-    use std::sync::Arc;
 
     // --- combine_ranges zero-copy fast path ---
 
@@ -1474,10 +1478,10 @@ mod tests {
     }
 
     async fn create_test_read_bypass_context_with_size(size: usize) -> Arc<ReadBypassContext> {
+        use crate::sync::Arc;
         use aws_sdk_s3::operation::get_object::GetObjectOutput;
         use aws_sdk_s3::primitives::ByteStream;
         use aws_smithy_mocks::{mock, mock_client};
-        use std::sync::Arc;
 
         let get_object_rule = mock!(aws_sdk_s3::Client::get_object)
             .match_requests(|_req| true)
@@ -1625,7 +1629,9 @@ mod tests {
         assert_eq!(pattern, ReadPattern::SequentialRead);
 
         // Large backward read beyond window_size should be RandomRead
-        let window_size = state.window_size.load(std::sync::atomic::Ordering::SeqCst);
+        let window_size = state
+            .window_size
+            .load(crate::sync::atomic::Ordering::SeqCst);
         state.update_read_position(window_size + 1000);
         // Use offset 10 (not 0) to avoid StartOfFile pattern
         let pattern = recognize_read_pattern_with_lock(&state, 10..20).await;
@@ -2696,7 +2702,7 @@ mod tests {
             .await;
 
         match result {
-            Err(e) => assert!(e.message.contains("capacity")),
+            Err(e) => assert!(matches!(e, ReadAheadCacheError::MemoryPoolAtCapacity)),
             Ok(_) => panic!("Expected error due to capacity"),
         }
     }

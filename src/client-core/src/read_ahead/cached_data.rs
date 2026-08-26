@@ -5,12 +5,12 @@
 //! while the data is initialized. This allows for concurrent reads of the same data,
 //! improving performance for read-heavy workloads.
 
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Arc;
 use atomic_enum::atomic_enum;
 use bytes::Bytes;
 use log::{error, warn};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard};
 
@@ -159,9 +159,9 @@ impl CachedData {
         {
             // If there's already data, don't overwrite it
             if !data_guard.is_empty() {
-                let error = ReadAheadCacheError {
-                    message: "Cannot load data over existing cached data".to_string(),
-                };
+                let error = ReadAheadCacheError::Other(
+                    "Cannot load data over existing cached data".to_string(),
+                );
                 error!("{}", error);
                 return Err(error);
             }
@@ -191,9 +191,9 @@ impl CachedData {
                 // Entry is already removed from cache index; memory chunks
                 // will be returned to pool when outstanding Bytes references drop.
                 warn!("Timeout acquiring write lock in clear()");
-                return Err(ReadAheadCacheError {
-                    message: "Timeout acquiring write lock in clear()".to_string(),
-                });
+                return Err(ReadAheadCacheError::Other(
+                    "Timeout acquiring write lock in clear()".to_string(),
+                ));
             }
         };
 
@@ -214,9 +214,8 @@ impl CachedData {
         last_read_end_position: u64,
     ) -> Result<(), ReadAheadCacheError> {
         if last_read_end_position == 0 {
-            let error = ReadAheadCacheError {
-                message: "Read position must be greater than 0".to_string(),
-            };
+            let error =
+                ReadAheadCacheError::Other("Read position must be greater than 0".to_string());
             error!("{}", error);
             return Err(error);
         }
@@ -253,22 +252,18 @@ impl CachedData {
 
         match state {
             CacheEntryState::Loading => {
-                return Err(ReadAheadCacheError {
-                    message: format!(
-                        "Timeout waiting for cache entry to load (start: {} end: {}) within {}s",
-                        range.start, range.end, DEFAULT_TIME_OUT_SECOND
-                    ),
-                });
+                return Err(ReadAheadCacheError::Other(format!(
+                    "Timeout waiting for cache entry to load (start: {} end: {}) within {}s",
+                    range.start, range.end, DEFAULT_TIME_OUT_SECOND
+                )));
             }
             CacheEntryState::Failed => {
-                return Err(ReadAheadCacheError {
-                    message: "Cache entry failed to load".to_string(),
-                });
+                return Err(ReadAheadCacheError::Other(
+                    "Cache entry failed to load".to_string(),
+                ));
             }
             CacheEntryState::Evicted => {
-                return Err(ReadAheadCacheError {
-                    message: "Data evicted before read completed".to_string(),
-                });
+                return Err(ReadAheadCacheError::DataEvicted);
             }
             CacheEntryState::Loaded => {}
         }
@@ -286,23 +281,19 @@ impl CachedData {
             let guard = self.data.clone().read_owned().await;
             // Re-check state after acquiring lock - eviction sets state before clearing data
             if self.get_state() != CacheEntryState::Loaded {
-                return Err(ReadAheadCacheError {
-                    message: "Data evicted before read completed".to_string(),
-                });
+                return Err(ReadAheadCacheError::DataEvicted);
             }
             if guard.is_empty() {
-                return Err(ReadAheadCacheError {
-                    message: "Cache entry has no data despite Loaded state".to_string(),
-                });
+                return Err(ReadAheadCacheError::Other(
+                    "Cache entry has no data despite Loaded state".to_string(),
+                ));
             }
             if start_chunk >= guard.len() {
-                return Err(ReadAheadCacheError {
-                    message: format!(
-                        "Start chunk index ({}) is beyond available data length ({})",
-                        start_chunk,
-                        guard.len()
-                    ),
-                });
+                return Err(ReadAheadCacheError::Other(format!(
+                    "Start chunk index ({}) is beyond available data length ({})",
+                    start_chunk,
+                    guard.len()
+                )));
             }
             let slice = ChunkSlice {
                 guard,
@@ -317,15 +308,13 @@ impl CachedData {
         let data_guard = self.acquire_read_lock().await?;
         // Re-check state after acquiring lock - eviction sets state before clearing data
         if self.get_state() != CacheEntryState::Loaded {
-            return Err(ReadAheadCacheError {
-                message: "Data evicted before read completed".to_string(),
-            });
+            return Err(ReadAheadCacheError::DataEvicted);
         }
         if data_guard.is_empty() {
             // This shouldn't happen if state is Loaded, but handle defensively
-            return Err(ReadAheadCacheError {
-                message: "Cache entry has no data despite Loaded state".to_string(),
-            });
+            return Err(ReadAheadCacheError::Other(
+                "Cache entry has no data despite Loaded state".to_string(),
+            ));
         }
 
         self.copy_data_from_chunks(&data_guard, offset, length)
@@ -344,13 +333,11 @@ impl CachedData {
         let start_byte_in_chunk = offset_usize % memory_pool::CHUNK_SIZE;
 
         if start_chunk_idx >= data_guard.len() {
-            return Err(ReadAheadCacheError {
-                message: format!(
-                    "Start chunk index ({}) is beyond available data length ({})",
-                    start_chunk_idx,
-                    data_guard.len()
-                ),
-            });
+            return Err(ReadAheadCacheError::Other(format!(
+                "Start chunk index ({}) is beyond available data length ({})",
+                start_chunk_idx,
+                data_guard.len()
+            )));
         }
 
         let mut result_data = Vec::with_capacity(length as usize);
@@ -366,13 +353,11 @@ impl CachedData {
             };
 
             if start_pos >= memory_pool::CHUNK_SIZE {
-                let error = ReadAheadCacheError {
-                    message: format!(
-                        "Invalid start position ({}) exceeds chunk size ({})",
-                        start_pos,
-                        memory_pool::CHUNK_SIZE
-                    ),
-                };
+                let error = ReadAheadCacheError::Other(format!(
+                    "Invalid start position ({}) exceeds chunk size ({})",
+                    start_pos,
+                    memory_pool::CHUNK_SIZE
+                ));
                 error!("{}", error);
                 return Err(error);
             }
@@ -383,10 +368,10 @@ impl CachedData {
             let bytes_available_in_chunk = memory_pool::CHUNK_SIZE - start_pos;
             let bytes_to_copy = bytes_remaining_usize.min(bytes_available_in_chunk);
             if start_pos + bytes_to_copy > memory_pool::CHUNK_SIZE {
-                let error = ReadAheadCacheError {
-                    message: format!("Would read beyond chunk boundary: start_pos ({}) + bytes_to_copy ({}) > chunk_size ({})", 
-                                    start_pos, bytes_to_copy, memory_pool::CHUNK_SIZE)
-                };
+                let error = ReadAheadCacheError::Other(format!(
+                    "Would read beyond chunk boundary: start_pos ({}) + bytes_to_copy ({}) > chunk_size ({})",
+                    start_pos, bytes_to_copy, memory_pool::CHUNK_SIZE
+                ));
                 error!("{}", error);
                 return Err(error);
             }
@@ -398,12 +383,10 @@ impl CachedData {
 
         // If we couldn't get all the requested data fail the request
         if bytes_copied < length {
-            let error = ReadAheadCacheError {
-                message: format!(
-                    "Could not satisfy entire read request: bytes_copied ({}) < length ({})",
-                    bytes_copied, length
-                ),
-            };
+            let error = ReadAheadCacheError::Other(format!(
+                "Could not satisfy entire read request: bytes_copied ({}) < length ({})",
+                bytes_copied, length
+            ));
             warn!("{}", error);
             return Err(error);
         }
@@ -415,12 +398,10 @@ impl CachedData {
     /// Returns the offset and length if valid, or an error if invalid
     fn validate_range(&self, range: Range<u64>) -> Result<(u64, u64), ReadAheadCacheError> {
         if range.start >= range.end {
-            let error = ReadAheadCacheError {
-                message: format!(
-                    "Invalid range: start ({}) must be less than end ({})",
-                    range.start, range.end
-                ),
-            };
+            let error = ReadAheadCacheError::Other(format!(
+                "Invalid range: start ({}) must be less than end ({})",
+                range.start, range.end
+            ));
             error!("{}", error);
             return Err(error);
         }
@@ -428,13 +409,11 @@ impl CachedData {
         let offset = range.start;
         let length = range.end - range.start;
         if length > usize::MAX as u64 {
-            let error = ReadAheadCacheError {
-                message: format!(
-                    "Length ({}) too large for this system (max: {})",
-                    length,
-                    usize::MAX
-                ),
-            };
+            let error = ReadAheadCacheError::Other(format!(
+                "Length ({}) too large for this system (max: {})",
+                length,
+                usize::MAX
+            ));
             error!("{}", error);
             return Err(error);
         }
@@ -453,7 +432,7 @@ impl CachedData {
 mod tests {
     use super::*;
     use crate::memory::memory_pool::MemoryPoolConfig;
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     fn create_test_chunk(data: &[u8]) -> MemoryChunk {
         let memory_pool = create_test_memory_pool();
@@ -560,9 +539,8 @@ mod tests {
 
         let err = cached_data.get_data_range(0..5).await.unwrap_err();
         assert!(
-            err.message.contains("Data evicted"),
-            "Error should trigger retry: {}",
-            err.message
+            matches!(err, ReadAheadCacheError::DataEvicted),
+            "Error should trigger retry: {err}"
         );
     }
 

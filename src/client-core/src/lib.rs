@@ -13,6 +13,7 @@ pub mod error;
 pub mod memory;
 pub mod proxy_identifier;
 pub mod read_ahead;
+pub mod sync;
 pub mod util;
 pub mod utils;
 

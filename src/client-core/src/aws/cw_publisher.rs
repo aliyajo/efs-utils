@@ -1,6 +1,8 @@
 //! ### CloudWatch metrics and logs emission
 //!
 
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Arc;
 use crate::{
     aws::credentials::get_aws_config_loader, aws::utils::get_ec2_instance_id,
     config_parser::ProxyConfig, utils::is_running_on_lambda,
@@ -11,8 +13,6 @@ use aws_sdk_cloudwatchlogs::{
     types::InputLogEvent,
 };
 use log::{info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metrics names and namespaces
@@ -794,7 +794,7 @@ mod tests {
     }
 
     // Tests for ensure_log_group_and_stream
-    use std::sync::Arc;
+    use crate::sync::Arc;
     use tokio::sync::Mutex;
 
     struct MockCWLogsHelper {

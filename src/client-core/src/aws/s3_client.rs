@@ -1,12 +1,8 @@
 #![allow(unused)]
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Error, Result};
 use async_trait::async_trait;
@@ -27,6 +23,7 @@ use crate::{
         cw_publisher::{CloudWatchClient, CloudWatchPublisher, LogLevel, CW_NAMESPACE_S3FILES},
     },
     config_parser::{ProxyConfig, ReadBypassConfig},
+    memory::memory_pool::{MemoryChunk, CHUNK_SIZE},
 };
 
 const DEFAULT_PERMISSION_VALIDATION_SECONDS: u64 = 60;
@@ -45,7 +42,7 @@ pub struct PermissionCheckResult {
     pub should_enable: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum S3ClientError {
     #[error("S3 Bucket is currently inaccessible.")]
     NotEnabled,
@@ -59,8 +56,36 @@ pub enum S3ClientError {
     #[error("S3 returned {actual} bytes, expected {expected}")]
     SizeMismatch { expected: u64, actual: u64 },
 
-    #[error(transparent)]
-    NoAccess(#[from] Box<dyn std::error::Error + Send + Sync>),
+    // GetObject failures not picked off as `NoSuchKey` / `ETagMismatchError`
+    // are classified into the variants below at construction, while the
+    // typed evidence (SDK failure kind, raw HTTP status) still exists — see
+    // `from_wire_failure`. The underlying SDK error is logged with key/etag
+    // context at the construction site; the variants carry only the class.
+    // They are evidence, not policy: they say what happened; callers own
+    // the retry/denylist verdict.
+    /// The request was denied (HTTP 403).
+    #[error("S3 GetObject access denied")]
+    AccessDenied,
+
+    /// The request timed out before completing.
+    #[error("S3 GetObject timed out")]
+    Timeout,
+
+    /// The service pushed back (HTTP 429 / 5xx).
+    #[error("S3 GetObject throttled")]
+    Throttled,
+
+    /// The request never got an HTTP answer (dispatch/connection failure),
+    /// or the connection died mid-body-stream. Mid-stream failures are
+    /// always this class: once body frames are flowing S3 has already sent
+    /// the 200 status line — auth and `If-Match` were evaluated before it,
+    /// and service pushback arrives as a status code, never mid-body.
+    #[error("S3 GetObject connection failure")]
+    Connection,
+
+    /// No classification evidence available.
+    #[error("S3 GetObject failed")]
+    Unknown,
 
     #[error("Permission Validator is already running")]
     ValidatorAlreadyRunning,
@@ -76,6 +101,44 @@ pub enum S3ClientError {
 
     #[error("S3 fetch semaphore closed")]
     SemaphoreClosed,
+}
+
+impl S3ClientError {
+    /// Classify a GetObject SdkError from its structure — failure kind
+    /// first, then the parsed service-error code, then the raw HTTP status.
+    /// (`NoSuchKey` and the structured 412 are picked off by
+    /// `extract_s3_error` before this runs; the 404/412 arms cover stray
+    /// raw responses that carried no parsed service error.) The caller
+    /// owns logging the SdkError.
+    fn from_wire_failure(e: &aws_sdk_s3::error::SdkError<GetObjectError>) -> Self {
+        use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+        match e {
+            SdkError::TimeoutError(_) => Self::Timeout,
+            SdkError::DispatchFailure(d) => {
+                if d.as_connector_error().is_some_and(|c| c.is_timeout()) {
+                    Self::Timeout
+                } else {
+                    Self::Connection
+                }
+            }
+            _ => {
+                // S3 reports a slow-client timeout as HTTP 400 with error
+                // code RequestTimeout (retryable per the S3 docs), so the
+                // parsed code must be consulted before the raw status —
+                // a bare 400 arm would misclassify genuine bad requests.
+                if e.as_service_error().and_then(|se| se.code()) == Some("RequestTimeout") {
+                    return Self::Timeout;
+                }
+                match e.raw_response().map(|r| r.status().as_u16()) {
+                    Some(403) => Self::AccessDenied,
+                    Some(404) => Self::NoSuchKey,
+                    Some(412) => Self::ETagMismatchError,
+                    Some(429) | Some(500) | Some(502) | Some(503) | Some(504) => Self::Throttled,
+                    _ => Self::Unknown,
+                }
+            }
+        }
+    }
 }
 
 pub struct S3Client {
@@ -104,6 +167,15 @@ impl Clone for S3Client {
             cancellation_token: CancellationToken::new(),
         }
     }
+}
+
+/// The object identity one GET runs against, within the client's
+/// configured bucket. A set `version_id` pins the GET to that object
+/// version; otherwise the request is conditional on `etag` (`If-Match`).
+pub struct GetObjectTarget<'a> {
+    pub key: &'a str,
+    pub etag: &'a str,
+    pub version_id: &'a str,
 }
 
 impl S3Client {
@@ -368,19 +440,18 @@ impl S3Client {
     ) -> S3ClientError {
         let error = if let Some(GetObjectError::NoSuchKey(_)) = e.as_service_error() {
             S3ClientError::NoSuchKey
-        } else if let Some(resp) = e.raw_response() {
-            if resp.status().as_u16() == 412 {
-                S3ClientError::ETagMismatchError
-            } else {
-                S3ClientError::NoAccess(e.into())
-            }
+        } else if e
+            .raw_response()
+            .is_some_and(|resp| resp.status().as_u16() == 412)
+        {
+            S3ClientError::ETagMismatchError
         } else {
-            S3ClientError::NoAccess(e.into())
+            S3ClientError::from_wire_failure(&e)
         };
 
         let msg = format!(
-            "S3 GetObject failed: key='{}', etag='{}', {}, error='{:?}'",
-            object_name, etag, context, error
+            "S3 GetObject failed ({}): key='{}', etag='{}', {}, error='{:?}'",
+            error, object_name, etag, context, e
         );
         if let Some(publisher) = &self.cw_publisher {
             publisher.emit_log(LogLevel::Error, &msg);
@@ -458,7 +529,21 @@ impl S3Client {
             // within the response instead of reallocating.
             let mut body = response.body;
             while let Some(frame) = body.next().await {
-                let frame = frame.map_err(|e| S3ClientError::NoAccess(e.into()))?;
+                let frame = frame.map_err(|e| {
+                    // Mid-stream failures are always Connection: after the
+                    // 200 status line, terminal verdicts are impossible.
+                    // Log with object context, like the wire path in
+                    // extract_s3_error: a partial transfer is hard to
+                    // root-cause without it.
+                    let msg = format!(
+                        "S3 GetObject failed mid-stream: key='{}', etag='{}', error='{:?}'",
+                        object_name, etag, e
+                    );
+                    if let Some(publisher) = &self.cw_publisher {
+                        publisher.emit_log(LogLevel::Error, &msg);
+                    }
+                    S3ClientError::Connection
+                })?;
                 result.extend_from_slice(&frame);
             }
         }
@@ -468,6 +553,91 @@ impl S3Client {
 
     fn is_version_id_set(version_id: &str) -> bool {
         !version_id.is_empty() && !version_id.eq_ignore_ascii_case("null")
+    }
+
+    /// One ranged GET for `[offset, offset + count)`, streamed directly into
+    /// the caller's pre-claimed pool `chunks` — no full-body
+    /// materialization. Each received frame slice is copied exactly once, at
+    /// its final chunk offset (a frame straddling a chunk boundary
+    /// split-copies across the two chunks), and dropped immediately so hyper
+    /// reuses its per-connection read buffer.
+    ///
+    /// Chunk claiming — and therefore pool backpressure policy — belongs to
+    /// the caller; `chunks` must cover `count` bytes. The call issues a
+    /// SINGLE request: request sizing and concurrency are the caller's.
+    ///
+    /// Returns the number of bytes filled (always a contiguous prefix of
+    /// `chunks`). Fewer than `count` means the body ended inside the range
+    /// (the object ends there) and is the caller's to interpret; a body
+    /// longer than `count` fails as [`S3ClientError::SizeMismatch`] — the
+    /// chunk claim is never overrun.
+    pub async fn get_object_into_chunks(
+        &self,
+        target: &GetObjectTarget<'_>,
+        offset: u64,
+        count: usize,
+        chunks: &mut [MemoryChunk],
+    ) -> Result<usize, S3ClientError> {
+        if !self.is_enabled() {
+            return Err(S3ClientError::NotEnabled);
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        debug_assert!(
+            count <= chunks.len() * CHUNK_SIZE,
+            "chunk claim must cover the requested range"
+        );
+        let mut req = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(target.key)
+            .range(format!("bytes={}-{}", offset, offset + count as u64 - 1));
+        req = if Self::is_version_id_set(target.version_id) {
+            req.version_id(target.version_id)
+        } else {
+            req.if_match(target.etag)
+        };
+        let response = req
+            .send()
+            .await
+            .map_err(|e| self.extract_s3_error(e, target.key, target.etag, "GetObject"))?;
+        let mut body = response.body;
+        let mut filled = 0usize;
+        while let Some(frame) = body.next().await {
+            let frame = frame.map_err(|e| {
+                warn!(
+                    "S3 streaming GET body failed mid-stream: key='{}' offset={} filled={} error='{:?}'",
+                    target.key, offset, filled, e
+                );
+                S3ClientError::Connection
+            })?;
+            if filled + frame.len() > count {
+                warn!(
+                    "S3 streaming GET body exceeded the requested range: key='{}' offset={} count={} received>={}",
+                    target.key,
+                    offset,
+                    count,
+                    filled + frame.len()
+                );
+                return Err(S3ClientError::SizeMismatch {
+                    expected: count as u64,
+                    actual: (filled + frame.len()) as u64,
+                });
+            }
+            // Split-copy: each slice lands at its final chunk offset.
+            let mut src = &frame[..];
+            while !src.is_empty() {
+                let chunk_index = filled / CHUNK_SIZE;
+                let chunk_offset = filled % CHUNK_SIZE;
+                let n = src.len().min(CHUNK_SIZE - chunk_offset);
+                chunks[chunk_index][chunk_offset..chunk_offset + n].copy_from_slice(&src[..n]);
+                src = &src[n..];
+                filled += n;
+            }
+        }
+        Ok(filled)
     }
 
     pub fn is_bucket_name_valid(bucket_name: &str) -> bool {
@@ -854,6 +1024,232 @@ mod tests {
         assert!(matches!(result.unwrap_err(), S3ClientError::NotEnabled));
     }
 
+    /// Claim `n` chunks from a throwaway pool sized exactly `n`.
+    fn test_chunks(n: usize) -> Vec<MemoryChunk> {
+        let pool = crate::memory::memory_pool::MemoryPool::new(
+            crate::memory::memory_pool::MemoryPoolConfig {
+                initial_capacity: n,
+                min_capacity: n,
+                max_capacity: n,
+                ..Default::default()
+            },
+        );
+        pool.consume(n)
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_fills_prefix_and_reports_len() {
+        let expected_content = b"streamed-content";
+        let get_object_rule = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| {
+                req.if_match() == Some("test-etag")
+                    && req.range() == Some("bytes=7-38")
+                    && req.bucket() == Some("test_bucket")
+            })
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(expected_content.len() as i64)
+                    .body(ByteStream::from_static(expected_content))
+                    .build()
+            });
+        let mock_client =
+            create_test_s3_client(mock_client!(aws_sdk_s3, [&get_object_rule]), None, true);
+
+        let mut chunks = test_chunks(1);
+        // count (32) exceeds the body (16): the short body is legal and the
+        // return value reports the contiguous filled prefix, not `count`.
+        let filled = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "",
+                },
+                7,
+                32,
+                &mut chunks,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, expected_content.len());
+        assert_eq!(&chunks[0][..filled], expected_content);
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_split_copies_across_chunk_boundary() {
+        // Body larger than one chunk: the fill must cross the chunk boundary
+        // with each byte at its final offset (no intermediate buffer).
+        let body: Vec<u8> = (0..CHUNK_SIZE + 512).map(|i| (i % 251) as u8).collect();
+        let body_clone = body.clone();
+        let get_object_rule = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(body_clone.len() as i64)
+                .body(ByteStream::from(body_clone.clone()))
+                .build()
+        });
+        let mock_client =
+            create_test_s3_client(mock_client!(aws_sdk_s3, [&get_object_rule]), None, true);
+
+        let mut chunks = test_chunks(2);
+        let count = body.len();
+        let filled = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "",
+                },
+                0,
+                count,
+                &mut chunks,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, count);
+        assert_eq!(&chunks[0][..], &body[..CHUNK_SIZE]);
+        assert_eq!(&chunks[1][..512], &body[CHUNK_SIZE..]);
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_overflow_is_size_mismatch() {
+        // A body LONGER than `count` must fail without overrunning the claim.
+        let get_object_rule = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(24)
+                .body(ByteStream::from_static(b"twenty-four bytes long!!"))
+                .build()
+        });
+        let mock_client =
+            create_test_s3_client(mock_client!(aws_sdk_s3, [&get_object_rule]), None, true);
+
+        let mut chunks = test_chunks(1);
+        let result = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "",
+                },
+                0,
+                16,
+                &mut chunks,
+            )
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            S3ClientError::SizeMismatch {
+                expected: 16,
+                actual: 24
+            }
+        ));
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_version_id_pins_the_version() {
+        let expected_content = b"versioned";
+        let get_object_rule = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| {
+                req.version_id() == Some("v7")
+                    && req.if_match().is_none()
+                    && req.bucket() == Some("test_bucket")
+            })
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(expected_content.len() as i64)
+                    .body(ByteStream::from_static(expected_content))
+                    .build()
+            });
+        let mock_client =
+            create_test_s3_client(mock_client!(aws_sdk_s3, [&get_object_rule]), None, true);
+
+        let mut chunks = test_chunks(1);
+        let filled = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "v7",
+                },
+                0,
+                32,
+                &mut chunks,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&chunks[0][..filled], expected_content);
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_zero_count() {
+        // No rules registered: a request would panic the mock.
+        let mock_client = create_test_s3_client(mock_client!(aws_sdk_s3, []), None, true);
+        let filled = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "",
+                },
+                0,
+                0,
+                &mut [],
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, 0);
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_not_enabled() {
+        let mock_client = create_test_s3_client(mock_client!(aws_sdk_s3, []), None, false);
+        let mut chunks = test_chunks(1);
+        let result = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "test-etag",
+                    version_id: "",
+                },
+                0,
+                16,
+                &mut chunks,
+            )
+            .await;
+        assert!(matches!(result.unwrap_err(), S3ClientError::NotEnabled));
+    }
+
+    #[tokio::test]
+    pub async fn test_get_object_into_chunks_etag_mismatch() {
+        // The same extractor serves both GET paths: a 412 must surface as
+        // ETagMismatchError here exactly as it does from get_object_if_match.
+        let get_object_rule = mock!(aws_sdk_s3::Client::get_object).then_http_response(|| {
+            HttpResponse::new(
+                StatusCode::try_from(412).unwrap(),
+                SdkBody::from("Precondition Failed"),
+            )
+        });
+        let mock_client =
+            create_test_s3_client(mock_client!(aws_sdk_s3, [&get_object_rule]), None, true);
+
+        let mut chunks = test_chunks(1);
+        let result = mock_client
+            .get_object_into_chunks(
+                &GetObjectTarget {
+                    key: "test_object",
+                    etag: "wrong-etag",
+                    version_id: "",
+                },
+                0,
+                16,
+                &mut chunks,
+            )
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            S3ClientError::ETagMismatchError
+        ));
+    }
+
     #[tokio::test]
     pub async fn test_permission_validator_task() {
         // First call fails, second call succeeds
@@ -1143,7 +1539,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), S3ClientError::NoAccess(_)));
+        // The mock's error carries a dummy raw response (no real status),
+        // so the wire failure classifies as Unknown; what this test pins
+        // is that a mid-sequence chunk failure fails the whole request.
+        assert!(matches!(result.unwrap_err(), S3ClientError::Unknown));
     }
 
     #[tokio::test]
@@ -1263,18 +1662,18 @@ mod tests {
     // --- #2: Metric emission tests ---
 
     struct MockCloudWatchClient {
-        calls: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
-        log_calls: Arc<std::sync::Mutex<Vec<(LogLevel, String)>>>,
+        calls: Arc<crate::sync::Mutex<Vec<(String, bool)>>>,
+        log_calls: Arc<crate::sync::Mutex<Vec<(LogLevel, String)>>>,
     }
 
     impl MockCloudWatchClient {
         fn new() -> (
             Self,
-            Arc<std::sync::Mutex<Vec<(String, bool)>>>,
-            Arc<std::sync::Mutex<Vec<(LogLevel, String)>>>,
+            Arc<crate::sync::Mutex<Vec<(String, bool)>>>,
+            Arc<crate::sync::Mutex<Vec<(LogLevel, String)>>>,
         ) {
-            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let log_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let calls = Arc::new(crate::sync::Mutex::new(Vec::new()));
+            let log_calls = Arc::new(crate::sync::Mutex::new(Vec::new()));
             (
                 Self {
                     calls: calls.clone(),
@@ -1616,5 +2015,56 @@ mod tests {
         );
 
         tokio::time::resume();
+    }
+
+    // ── Wire failure classification ──
+
+    #[test_case(403, S3ClientError::AccessDenied; "403 access denied")]
+    #[test_case(404, S3ClientError::NoSuchKey; "404 no such key")]
+    #[test_case(412, S3ClientError::ETagMismatchError; "412 precondition")]
+    #[test_case(429, S3ClientError::Throttled; "429 throttled")]
+    #[test_case(500, S3ClientError::Throttled; "500 throttled")]
+    #[test_case(503, S3ClientError::Throttled; "503 throttled")]
+    #[test_case(418, S3ClientError::Unknown; "unmapped status is unknown")]
+    fn from_wire_failure_classifies_http_status(status: u16, expect: S3ClientError) {
+        // A real SdkError carrying the given HTTP status (the
+        // response-error shape has a raw response but no parsed service
+        // error — exactly what classification must handle).
+        let raw = HttpResponse::new(
+            StatusCode::try_from(status).unwrap(),
+            SdkBody::from("test body"),
+        );
+        let sdk: SdkError<GetObjectError> = SdkError::response_error("test".to_string(), raw);
+        assert_eq!(S3ClientError::from_wire_failure(&sdk), expect);
+    }
+
+    #[test]
+    fn from_wire_failure_classifies_sdk_timeout() {
+        let timeout: SdkError<GetObjectError> =
+            SdkError::timeout_error("request timed out".to_string());
+        assert_eq!(
+            S3ClientError::from_wire_failure(&timeout),
+            S3ClientError::Timeout
+        );
+    }
+
+    #[test]
+    fn from_wire_failure_classifies_s3_request_timeout_code() {
+        // S3's slow-client timeout arrives as HTTP 400 with error code
+        // RequestTimeout; the parsed code must win over the (unmapped)
+        // raw status, or a retryable timeout lands in Unknown.
+        let meta = aws_sdk_s3::error::ErrorMetadata::builder()
+            .code("RequestTimeout")
+            .message("Your socket connection to the server was not read from or written to within the timeout period.")
+            .build();
+        let raw = HttpResponse::new(
+            StatusCode::try_from(400).unwrap(),
+            SdkBody::from("test body"),
+        );
+        let sdk = SdkError::service_error(GetObjectError::generic(meta), raw);
+        assert_eq!(
+            S3ClientError::from_wire_failure(&sdk),
+            S3ClientError::Timeout
+        );
     }
 }

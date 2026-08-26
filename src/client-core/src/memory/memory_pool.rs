@@ -1,10 +1,10 @@
 #![allow(unused)]
 
+use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard, Weak};
 use log::debug;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 const ONE_MB_IN_BYTES: usize = 1024 * 1024;
@@ -470,8 +470,7 @@ impl MemoryPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use crate::sync::{thread, Arc, Barrier};
     use std::time::Duration;
 
     #[test]

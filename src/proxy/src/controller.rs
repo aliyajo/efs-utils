@@ -26,6 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 pub const METRICS_EMISSION_PERIOD: Duration = Duration::from_secs(60);
 
+// Max time to wait for the NFS client's first byte after we accept a reconnect. A connection that
+// is accepted but never sends data would otherwise block peek() forever and wedge the mount; on
+// timeout we drop it and return to accept().
+pub const PEEK_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub const AWSFILE_CHANNEL_INIT_MINOR_VERSION: u32 = 2;
 
 pub const DEFAULT_SCALE_UP_BACKOFF: Duration = Duration::from_secs(300);
@@ -180,17 +185,36 @@ impl<S: ProxyStream> Controller<S> {
                 }
             };
 
-            let peek_result = nfs_client.peek(&mut [0; 1]).await;
-            if let Ok(0) = peek_result {
-                // efs-utils performs a test in which it checks if a connection to the proxy port
-                // can be established. This connection is never used and is immediately closed.
-                // When this behavior is detected, this loops should be restarted so that another
-                // connection to the port can be established
-                debug!("Connection to nfs client was closed before any data was sent to the proxy. This is expected. Restarting controller");
-                continue;
-            } else if let Err(e) = peek_result {
-                error!("Failed to check if data was sent by the NFS client. {}", e);
-                return Some(ShutdownReason::UnexpectedError);
+            let peek_result =
+                tokio::time::timeout(PEEK_FIRST_BYTE_TIMEOUT, nfs_client.peek(&mut [0; 1])).await;
+            match peek_result {
+                Ok(Ok(0)) => {
+                    // efs-utils performs a test in which it checks if a connection to the proxy
+                    // port can be established. This connection is never used and is immediately
+                    // closed. When this behavior is detected, this loop should be restarted so
+                    // that another connection to the port can be established.
+                    debug!("Connection to nfs client was closed before any data was sent to the proxy. This is expected. Restarting controller");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to check if data was sent by the NFS client. {}", e);
+                    return Some(ShutdownReason::UnexpectedError);
+                }
+                Err(_elapsed) => {
+                    // The accepted connection sent no data within the timeout. A silent
+                    // connection (e.g. a non-NFS local process that connected to the loopback
+                    // listen port) would otherwise block here indefinitely and wedge the mount.
+                    warn!(
+                        "Accepted connection sent no data within {:?}; dropping it and re-accepting",
+                        PEEK_FIRST_BYTE_TIMEOUT
+                    );
+                    // Explicitly close the idle socket (sends FIN) before returning to accept().
+                    drop(nfs_client);
+                    continue;
+                }
+                Ok(Ok(_)) => {
+                    // The NFS client sent data; proceed to establish the upstream connection.
+                }
             }
 
             // Set init_deadline to be 1 second less than the `proxy_init_timeout_sec`, as we
@@ -739,5 +763,73 @@ mod tests {
         assert_eq!(reconnect_backoff(6), DEFAULT_RECONNECT_BACKOFF_CAP);
         // Very large counts must saturate to the cap, not overflow/panic.
         assert_eq!(reconnect_backoff(1000), DEFAULT_RECONNECT_BACKOFF_CAP);
+    }
+
+    // peek() reconnect-handoff tests: a connection that is accepted but never sends data is
+    // dropped after PEEK_FIRST_BYTE_TIMEOUT, and the NFS client's connection is then serviced.
+    use crate::test_utils::make_signaling_controller;
+    use tokio::io::AsyncWriteExt as _;
+
+    fn spawn_run(
+        controller: Controller<TcpStream>,
+    ) -> tokio::task::JoinHandle<Option<ShutdownReason>> {
+        tokio::spawn(controller.run(
+            CancellationToken::new(),
+            crate::awsfile_rpc::AwsFileRpcClient,
+            crate::aws::s3_client::S3ClientStandardBuilder,
+        ))
+    }
+
+    // An idle connection accepted first is dropped after the peek timeout, and the NFS client
+    // waiting in the listen backlog is then serviced.
+    #[tokio::test(start_paused = true)]
+    async fn idle_connection_is_dropped_and_nfs_client_is_served() {
+        let (addr, controller, mut rx) = make_signaling_controller().await;
+        let _handle = spawn_run(controller);
+
+        // Barrier: connect the idle socket and, before the peek timeout elapses, assert the
+        // controller has NOT established yet. This guarantees the idle socket (not the NFS
+        // client) is the one being peeked, so the test provably exercises the drop path.
+        let _idle = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(PEEK_FIRST_BYTE_TIMEOUT / 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "controller established before the idle socket's peek timed out"
+        );
+
+        // NFS client waits in the backlog; it must be served once the idle socket is dropped.
+        let mut nfs_client = TcpStream::connect(addr).await.unwrap();
+        nfs_client.write_all(&[0x80, 0, 0, 0]).await.unwrap();
+
+        let reached = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+        assert!(
+            matches!(reached, Ok(Some(()))),
+            "controller did not recover: NFS client was not served after the idle socket was dropped"
+        );
+    }
+
+    // After the idle socket is dropped on timeout, a NFS client that connects afterwards is still
+    // served -- i.e. dropping the idle socket returns the controller to accept().
+    #[tokio::test(start_paused = true)]
+    async fn nfs_client_connecting_after_idle_drop_is_served() {
+        let (addr, controller, mut rx) = make_signaling_controller().await;
+        let _handle = spawn_run(controller);
+
+        let idle = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(PEEK_FIRST_BYTE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "establish_connection reached with no data-sending client"
+        );
+        drop(idle);
+
+        let mut nfs_client = TcpStream::connect(addr).await.unwrap();
+        nfs_client.write_all(&[0x80, 0, 0, 0]).await.unwrap();
+
+        let reached = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+        assert!(
+            matches!(reached, Ok(Some(()))),
+            "NFS client connecting after the idle socket was dropped was not served"
+        );
     }
 }
