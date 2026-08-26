@@ -392,6 +392,81 @@ def test_get_aws_security_credentials_botocore_present_get_assumed_profile_crede
     utils.assert_called(botocore_get_assumed_profile_credentials_mock)
 
 
+def _mock_botocore_session(mocker, expiry_time):
+    # Build a fake botocore session whose credentials object mimics RefreshableCredentials
+    # (carries _expiry_time) or plain Credentials (no _expiry_time) when expiry_time is None.
+    frozen = mocker.MagicMock()
+    frozen.access_key = ACCESS_KEY_ID_VAL
+    frozen.secret_key = SECRET_ACCESS_KEY_VAL
+    frozen.token = SESSION_TOKEN_VAL
+
+    creds_object = mocker.MagicMock()
+    creds_object.get_frozen_credentials.return_value = frozen
+    if expiry_time is None:
+        # Plain Credentials have no _expiry_time attribute at all.
+        del creds_object._expiry_time
+    else:
+        creds_object._expiry_time = expiry_time
+
+    session = mocker.MagicMock()
+    session.get_credentials.return_value = creds_object
+
+    aws_credentials.BOTOCORE_PRESENT = True
+    mocker.patch("botocore.session.get_session", return_value=session)
+
+
+def test_botocore_credentials_helper_surfaces_expiration(mocker):
+    # An assumed-role/session profile carries an expiry (tz-aware UTC datetime); it must be
+    # surfaced as an ISO-8601 Expiration string so the watchdog can refresh the cert ahead of it.
+    from datetime import datetime, timezone
+
+    _mock_botocore_session(mocker, datetime(2026, 8, 6, 0, 38, 37, tzinfo=timezone.utc))
+
+    credentials = aws_credentials.botocore_credentials_helper("test-profile")
+
+    assert credentials["AccessKeyId"] == ACCESS_KEY_ID_VAL
+    assert credentials["Expiration"] == "2026-08-06T00:38:37Z"
+
+
+def test_botocore_credentials_helper_no_expiration_for_static_profile(mocker):
+    # A static profile has no expiry; no Expiration key is added and the caller falls back to
+    # the fixed renewal interval.
+    _mock_botocore_session(mocker, None)
+
+    credentials = aws_credentials.botocore_credentials_helper("test-profile")
+
+    assert credentials["AccessKeyId"] == ACCESS_KEY_ID_VAL
+    assert "Expiration" not in credentials
+
+
+def test_botocore_credentials_helper_ignores_non_datetime_expiry(mocker):
+    # Defensive: _expiry_time is a private botocore attribute; if it is ever not a datetime, skip
+    # surfacing Expiration (fall back to the fixed interval) rather than crash on strftime.
+    _mock_botocore_session(mocker, "not-a-datetime")
+
+    credentials = aws_credentials.botocore_credentials_helper("test-profile")
+
+    assert credentials["AccessKeyId"] == ACCESS_KEY_ID_VAL
+    assert "Expiration" not in credentials
+
+
+def test_is_valid_credentials_expiration():
+    # Whole-second ISO-8601 (the format every credential source and STS use) is accepted; absent,
+    # non-ISO, fractional-second, and epoch values are rejected so callers do not persist a value
+    # the watchdog cannot parse.
+    assert (
+        aws_credentials.is_valid_credentials_expiration("2026-08-06T00:38:37Z") is True
+    )
+    assert (
+        aws_credentials.is_valid_credentials_expiration("2026-08-06T00:38:37.123Z")
+        is False
+    )
+    assert aws_credentials.is_valid_credentials_expiration(None) is False
+    assert aws_credentials.is_valid_credentials_expiration("") is False
+    assert aws_credentials.is_valid_credentials_expiration("not-a-timestamp") is False
+    assert aws_credentials.is_valid_credentials_expiration("1786127616") is False
+
+
 def test_get_aws_security_credentials_credentials_not_found_in_aws_creds_uri(
     mocker, capsys
 ):
@@ -621,6 +696,45 @@ def test_get_aws_security_credentials_from_webidentity_real_builds_sts_url_and_p
     assert credentials_source == "webidentity:" + ",".join(
         [WEB_IDENTITY_ROLE_ARN, WEB_IDENTITY_TOKEN_FILE]
     )
+
+
+def test_get_aws_security_credentials_from_webidentity_carries_expiration(mocker):
+    # The STS Credentials.Expiration must be surfaced so the watchdog can schedule the cert
+    # refresh ahead of it. When STS omits Expiration, the returned value is None.
+    config = get_fake_config_with_dns_suffix("amazonaws.com")
+    mocker.patch("builtins.open", mocker.mock_open(read_data="FAKE_WEB_IDENTITY_JWT"))
+
+    response = _well_formed_webidentity_response()
+    expiration = "2019-10-25T21:17:24Z"
+    response["AssumeRoleWithWebIdentityResponse"]["AssumeRoleWithWebIdentityResult"][
+        "Credentials"
+    ]["Expiration"] = expiration
+    mocker.patch(
+        "efs_utils_common.aws_credentials.url_request_helper", return_value=response
+    )
+
+    credentials, _ = aws_credentials.get_aws_security_credentials_from_webidentity(
+        config,
+        WEB_IDENTITY_ROLE_ARN,
+        WEB_IDENTITY_TOKEN_FILE,
+        "us-east-1",
+        is_fatal=False,
+    )
+    assert credentials["Expiration"] == expiration
+
+    # No Expiration in the STS response => Expiration key present but None.
+    mocker.patch(
+        "efs_utils_common.aws_credentials.url_request_helper",
+        return_value=_well_formed_webidentity_response(),
+    )
+    credentials, _ = aws_credentials.get_aws_security_credentials_from_webidentity(
+        config,
+        WEB_IDENTITY_ROLE_ARN,
+        WEB_IDENTITY_TOKEN_FILE,
+        "us-east-1",
+        is_fatal=False,
+    )
+    assert credentials["Expiration"] is None
 
 
 def test_get_aws_security_credentials_from_webidentity_real_is_fatal_failure(

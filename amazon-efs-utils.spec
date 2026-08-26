@@ -41,8 +41,8 @@
 %{?!include_vendor_tarball:%define include_vendor_tarball true}
 
 Name      : amazon-efs-utils
-Version   : 3.3.0
-Release   : 3%{platform}
+Version   : 3.3.1
+Release   : 1%{platform}
 Summary   : This package provides utilities for simplifying the use of EFS file systems
 
 Group     : Amazon/Tools
@@ -221,6 +221,10 @@ fi
 %clean
 
 %changelog
+* Sat Aug 23 2026 Yue Wang <wangnyue@amazon.com> - 3.3.1
+- Schedule TLS cert refresh from credential expiration
+- Don't denylist file handles for transient S3 errors on readbypass path
+
 * Wed Aug 5 2026 Zachary Maguire <maguirza@amazon.com> 3.3.0
 - Eliminate unnecessary data copies on the readbypass path
 - Consolidating dependencies

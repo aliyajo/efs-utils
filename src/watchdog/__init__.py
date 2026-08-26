@@ -56,7 +56,7 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 SERVICE = "elasticfilesystem"
 FS_PREFIX = "fs-"
 
@@ -84,6 +84,8 @@ DEFAULT_NFS_PORT = "2049"
 EFS_SERVICE_NAME = "elasticfilesystem"
 PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
 DEFAULT_REFRESH_SELF_SIGNED_CERT_INTERVAL_MIN = 60
+# Refresh the certificate this many minutes before the credential (or the cert's own NOT_AFTER) expires.
+CERT_EXPIRATION_SAFETY_MARGIN_MIN = 5
 DEFAULT_STUNNEL_HEALTH_CHECK_INTERVAL_MIN = 5
 DEFAULT_STUNNEL_HEALTH_CHECK_TIMEOUT_SEC = 30
 NOT_BEFORE_MINS = 15
@@ -91,6 +93,7 @@ NOT_AFTER_HOURS = 3
 DATE_ONLY_FORMAT = "%Y%m%d"
 SIGV4_DATETIME_FORMAT = "%Y%m%dT%H%M%SZ"
 CERT_DATETIME_FORMAT = "%y%m%d%H%M%SZ"
+CREDENTIALS_EXPIRATION_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 AWS_CREDENTIALS_FILES = {
     "credentials": os.path.expanduser(
@@ -396,7 +399,8 @@ def botocore_credentials_helper(awsprofile):
     session.set_config_variable("profile", awsprofile)
 
     try:
-        frozen_credentials = session.get_credentials().get_frozen_credentials()
+        creds_object = session.get_credentials()
+        frozen_credentials = creds_object.get_frozen_credentials()
     except ProfileNotFound as e:
         logging.error(
             "%s, please add the [profile %s] section in the aws config file following %s and %s."
@@ -407,6 +411,13 @@ def botocore_credentials_helper(awsprofile):
     credentials["AccessKeyId"] = frozen_credentials.access_key
     credentials["SecretAccessKey"] = frozen_credentials.secret_key
     credentials["Token"] = frozen_credentials.token
+    # Surface the expiration for temporary (assumed-role/session) profiles so refresh schedules
+    # ahead of it. botocore exposes it only via the private _expiry_time; static profiles have none.
+    expiry_time = getattr(creds_object, "_expiry_time", None)
+    if isinstance(expiry_time, datetime):
+        credentials["Expiration"] = expiry_time.strftime(
+            CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+        )
     return credentials
 
 
@@ -520,6 +531,7 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
                 "AccessKeyId": creds["AccessKeyId"],
                 "SecretAccessKey": creds["SecretAccessKey"],
                 "Token": creds["SessionToken"],
+                "Expiration": creds.get("Expiration"),
             }
 
     return None
@@ -1664,20 +1676,69 @@ def read_config(config_file=CONFIG_FILE):
     return p
 
 
+def parse_credentials_expiration(expiration):
+    """Parse a credential "Expiration" ISO-8601 string into a tz-aware UTC datetime, or None.
+
+    Values are validated at the persist sites, so a failure here (absent or corrupted state) falls
+    back to the fixed interval silently.
+    """
+    if not expiration:
+        return None
+    try:
+        return datetime.strptime(
+            expiration, CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+        ).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_certificate_refresh_deadline(
+    certificate_creation_time,
+    renewal_interval_secs,
+    credentials_expiration,
+):
+    """Return the UTC datetime at which the certificate should next be refreshed.
+
+    The deadline is the earliest of:
+      - the fixed renewal interval,
+      - the credential's expiration, less the safety margin, and
+      - the certificate's own NOT_AFTER lifetime, less the safety margin.
+    """
+    safety_margin = timedelta(minutes=CERT_EXPIRATION_SAFETY_MARGIN_MIN)
+    interval_deadline = certificate_creation_time + timedelta(
+        seconds=renewal_interval_secs
+    )
+    cert_ttl_deadline = (
+        certificate_creation_time + timedelta(hours=NOT_AFTER_HOURS) - safety_margin
+    )
+    deadline = min(interval_deadline, cert_ttl_deadline)
+    if credentials_expiration is not None:
+        deadline = min(deadline, credentials_expiration - safety_margin)
+    return deadline
+
+
 def check_certificate(
     config, state, state_file_dir, state_file, service, base_path=STATE_FILE_DIR
 ):
     certificate_creation_time = datetime.strptime(
         state["certificateCreationTime"], CERT_DATETIME_FORMAT
-    )
+    ).replace(tzinfo=timezone.utc)
     certificate_exists = os.path.isfile(state["certificate"])
     certificate_renewal_interval_secs = (
         get_certificate_renewal_interval_mins(config) * 60
     )
+    now = get_utc_now()
+
     # creation instead of NOT_BEFORE datetime is used for refresh of cert because NOT_BEFORE derives from creation datetime
-    should_refresh_cert = (
-        get_utc_now() - certificate_creation_time.replace(tzinfo=timezone.utc)
-    ).total_seconds() > certificate_renewal_interval_secs
+    credentials_expiration = parse_credentials_expiration(
+        state.get("certificateExpirationTime")
+    )
+    refresh_deadline = get_certificate_refresh_deadline(
+        certificate_creation_time,
+        certificate_renewal_interval_secs,
+        credentials_expiration,
+    )
+    should_refresh_cert = now > refresh_deadline
 
     if certificate_exists and not should_refresh_cert:
         return
@@ -1699,21 +1760,38 @@ def check_certificate(
         logging.debug(
             "Refreshing self-signed certificate (at %s)" % state["certificate"]
         )
+        interval_deadline = certificate_creation_time + timedelta(
+            seconds=certificate_renewal_interval_secs
+        )
+        if refresh_deadline < interval_deadline:
+            logging.debug(
+                "Refreshing %s early: scheduled deadline %s precedes the fixed-interval deadline %s",
+                state["certificate"],
+                refresh_deadline.strftime(CREDENTIALS_EXPIRATION_DATETIME_FORMAT),
+                interval_deadline.strftime(CREDENTIALS_EXPIRATION_DATETIME_FORMAT),
+            )
 
     credentials_source = state.get("awsCredentialsMethod")
-    updated_certificate_creation_time = recreate_certificate(
-        config,
-        state["mountStateDir"],
-        state["commonName"],
-        state["fsId"],
-        credentials_source,
-        ap_state,
-        state["region"],
-        service,
-        base_path=base_path,
+    updated_certificate_creation_time, updated_credentials_expiration = (
+        recreate_certificate(
+            config,
+            state["mountStateDir"],
+            state["commonName"],
+            state["fsId"],
+            credentials_source,
+            ap_state,
+            state["region"],
+            service,
+            base_path=base_path,
+        )
     )
     if updated_certificate_creation_time:
         state["certificateCreationTime"] = updated_certificate_creation_time
+        # updated_credentials_expiration is pre-validated by create_ca_conf: valid ISO-8601 or None.
+        if updated_credentials_expiration:
+            state["certificateExpirationTime"] = updated_credentials_expiration
+        else:
+            state.pop("certificateExpirationTime", None)
         rewrite_state_file(state, state_file_dir, state_file)
 
         # send SIGHUP to force a reload of the configuration file to trigger the stunnel process to notice the new certificate
@@ -1833,7 +1911,7 @@ def recreate_certificate(
         create_public_key(private_key, public_key)
 
     client_info = get_client_info(config)
-    config_body = create_ca_conf(
+    config_body, credentials_expiration = create_ca_conf(
         config,
         certificate_config,
         common_name,
@@ -1850,7 +1928,7 @@ def recreate_certificate(
 
     if not config_body:
         logging.error("Cannot recreate self-signed certificate")
-        return None
+        return None, None
 
     create_certificate_signing_request(
         certificate_config, private_key, certificate_signing_request
@@ -1870,7 +1948,7 @@ def recreate_certificate(
         )
     )
     subprocess_call(cmd, "Failed to create self-signed client-side certificate")
-    return current_time.strftime(CERT_DATETIME_FORMAT)
+    return current_time.strftime(CERT_DATETIME_FORMAT), credentials_expiration
 
 
 def get_private_key_path():
@@ -1964,7 +2042,13 @@ def create_ca_conf(
     ap_id=None,
     client_info=None,
 ):
-    """Populate ca/req configuration file with fresh configurations at every mount since SigV4 signature can change"""
+    """Populate ca/req configuration file with fresh configurations at every mount since SigV4 signature can change
+
+    Returns a (full_config_body, credentials_expiration) tuple. credentials_expiration is the
+    credential's "Expiration" as a valid ISO-8601 string when the source provides a usable one,
+    else None (absent, or present but unparseable). It lets the caller schedule the next refresh
+    before the embedded credential expires. On failure returns (None, None).
+    """
     public_key_path = os.path.join(directory, "publicKey.pem")
     security_credentials = (
         get_aws_security_credentials(config, credentials_source, region)
@@ -1977,7 +2061,39 @@ def create_ca_conf(
             "Failed to retrieve AWS security credentials using lookup method: %s",
             credentials_source,
         )
-        return None
+        return None, None
+
+    credentials_expiration = (
+        security_credentials.get("Expiration") if security_credentials else None
+    )
+
+    # Validate the expiration once, here, so the caller can persist the returned value without
+    # re-checking it: it is normalized to a valid ISO-8601 string or None.
+    if credentials_expiration:
+        parsed_expiration = parse_credentials_expiration(credentials_expiration)
+        if parsed_expiration is None:
+            # Present but unparseable: mint the cert, but drop the value so the refresh falls back
+            # to the fixed interval (can't schedule against a timestamp we can't read).
+            logging.warning(
+                'Credential expiration "%s" is not valid ISO-8601; certificate refresh will fall '
+                "back to the fixed interval",
+                credentials_expiration,
+            )
+            credentials_expiration = None
+        elif parsed_expiration <= date:
+            # A cert minted from already-expired credentials would be rejected on the next
+            # handshake; treat expired creds as a fetch failure rather than minting a doomed cert.
+            logging.error(
+                "Credential source returned already-expired credentials (expired %s); not "
+                "generating a certificate",
+                credentials_expiration,
+            )
+            return None, None
+    elif security_credentials:
+        logging.debug(
+            "No expiration available for these credentials; certificate refresh falls back to "
+            "the fixed interval"
+        )
 
     ca_extension_body = ca_extension_builder(
         ap_id, security_credentials, fs_id, client_info
@@ -2001,7 +2117,7 @@ def create_ca_conf(
             "Failed to create AWS SigV4 signature section for OpenSSL config. Public Key path: %s",
             public_key_path,
         )
-        return None
+        return None, None
     efs_client_info_body = efs_client_info_builder(client_info) if client_info else ""
     full_config_body = CA_CONFIG_BODY % (
         directory,
@@ -2015,7 +2131,7 @@ def create_ca_conf(
     with open(config_path, "w") as f:
         f.write(full_config_body)
 
-    return full_config_body
+    return full_config_body, credentials_expiration
 
 
 def ca_extension_builder(ap_id, security_credentials, fs_id, client_info):
@@ -2084,7 +2200,7 @@ def subprocess_call(cmd, error_message):
     process = subprocess.Popen(
         cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
     )
-    (output, err) = process.communicate()
+    output, err = process.communicate()
     rc = process.poll()
     if rc != 0:
         logging.debug(

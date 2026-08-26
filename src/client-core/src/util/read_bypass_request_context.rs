@@ -3,8 +3,8 @@
 //! for logging and tracing purposes.
 
 use super::read_bypass_context::ReadBypassContext;
+use crate::sync::Arc;
 use std::ops::Deref;
-use std::sync::Arc;
 use tokio::task::Id;
 
 pub struct ReadBypassRequestContext {
@@ -16,7 +16,7 @@ pub struct ReadBypassRequestContext {
 
 impl ReadBypassRequestContext {
     pub fn new(read_bypass_context: Arc<ReadBypassContext>, rpc_xid: u32) -> Self {
-        let thread_name = std::thread::current()
+        let thread_name = crate::sync::thread::current()
             .name()
             .unwrap_or("unknown")
             .to_string();
@@ -45,6 +45,13 @@ impl ReadBypassRequestContext {
     /// This prefix is automatically prepended by ctx_debug!, ctx_info!, ctx_warn!, ctx_error!, and ctx_trace! macros.
     pub fn log_prefix(&self) -> String {
         match self.task_id {
+            // shuttle-tokio's TaskId implements Debug but not Display.
+            // TODO: https://github.com/awslabs/shuttle/pull/307 adds the
+            // Display impl; once it merges and reaches the wrappers, drop
+            // this cfg split and keep the plain `{}` arm.
+            #[cfg(feature = "shuttle")]
+            Some(id) => format!("[{}-{:?}-{}]", self.thread_name, id, self.rpc_xid),
+            #[cfg(not(feature = "shuttle"))]
             Some(id) => format!("[{}-{}-{}]", self.thread_name, id, self.rpc_xid),
             None => format!("[{}-?-{}]", self.thread_name, self.rpc_xid),
         }

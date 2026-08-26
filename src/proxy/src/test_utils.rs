@@ -6,6 +6,7 @@
 
 use crate::{
     aws::cw_publisher::{CloudWatchClient, LogLevel},
+    aws::s3_client::S3ClientError,
     awsfile_prot::{
         self, AwsFileChannelInitArgs, AwsFileChannelInitRes, BindClientResponse, BindResponse,
         ScaleUpConfig,
@@ -17,21 +18,27 @@ use crate::{
     error::RpcError,
     nfs::{
         nfs4_1_xdr,
+        nfs4_1_xdr::{awsfile_bypass_data_locator, nfs_fh4},
         nfs_compound::{NfsMetadata, RefNfsCompoundInfo},
     },
     proxy_identifier::ProxyIdentifier,
+    read_bypass::read_bypass_agent::{ReadBypassAgentError, S3Reader},
     status_reporter::create_status_channel,
     tls::{create_config_builder, InsecureAcceptAllCertificatesHandler, TlsConfig},
+    util::read_bypass_request_context::ReadBypassRequestContext,
 };
 use anyhow::Result;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rand::{Rng, RngCore};
 use s2n_tls::config::Config;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io::Cursor, path::Path};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 // Proxy Configuration testing utils
 //
@@ -315,5 +322,91 @@ pub async fn make_test_controller(
         last_reachability_emit_at: None,
         reachability_emit_period: emit_period,
         consecutive_connect_failures: 0,
+    }
+}
+
+// PartitionFinder that signals when establish_connection is reached (i.e. the controller got
+// past peek()), then fails fast so the controller loops back to accept().
+pub struct SignalingPartitionFinder {
+    pub reached_establish: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl PartitionFinder<TcpStream> for SignalingPartitionFinder {
+    async fn create_connect_future(
+        &self,
+    ) -> futures::future::BoxFuture<'static, Result<TcpStream, crate::error::ConnectError>> {
+        unimplemented!("establish_connection is overridden; connect future is never used")
+    }
+
+    async fn establish_connection(
+        &self,
+        _deadline: Instant,
+        _proxy_id: ProxyIdentifier,
+    ) -> Result<
+        (
+            TcpStream,
+            Option<crate::awsfile_rpc::PartitionId>,
+            Option<ScaleUpConfig>,
+        ),
+        crate::error::ConnectError,
+    > {
+        let _ = self.reached_establish.send(());
+        Err(crate::error::ConnectError::Timeout)
+    }
+}
+
+// Build a Controller bound to an ephemeral localhost port whose PartitionFinder signals when
+// establish_connection is reached. Returns the listen address, the controller (spawn its run
+// loop in the test), and a receiver that fires on each establish_connection.
+pub async fn make_signaling_controller() -> (
+    SocketAddr,
+    Controller<TcpStream>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (_status_requester, status_reporter) = create_status_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut proxy_config = ProxyConfig::default();
+    proxy_config.nested_config.fs_id = "fs-test123".to_string();
+    let controller = Controller::<TcpStream> {
+        listener,
+        partition_finder: Arc::new(SignalingPartitionFinder {
+            reached_establish: tx,
+        }),
+        proxy_id: ProxyIdentifier::new(),
+        scale_up_attempt_count: 0,
+        restart_count: 0,
+        scale_up_config: DEFAULT_SCALE_UP_CONFIG,
+        status_reporter,
+        proxy_config,
+        cw_publisher: None,
+        last_reachability_emitted: None,
+        last_reachability_emit_at: None,
+        reachability_emit_period: Duration::from_secs(1),
+        consecutive_connect_failures: 0,
+    };
+    (addr, controller, rx)
+}
+
+// Read-bypass testing utils
+//
+
+/// Mock S3Reader whose reads always fail with a fixed S3 error class.
+pub struct FailingS3Reader {
+    pub make_error: fn() -> S3ClientError,
+}
+
+#[async_trait::async_trait]
+impl S3Reader for FailingS3Reader {
+    async fn read_data(
+        &self,
+        _read_bypass_request_context: Arc<ReadBypassRequestContext>,
+        _s3_data_locator: awsfile_bypass_data_locator,
+        _filehandle: nfs_fh4,
+        _file_size: u64,
+    ) -> Result<Option<Bytes>, ReadBypassAgentError> {
+        Err(ReadBypassAgentError::S3Error((self.make_error)()))
     }
 }

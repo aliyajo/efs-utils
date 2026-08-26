@@ -1,6 +1,8 @@
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
-use std::{error::Error, path::Path, str::FromStr};
+use std::error::Error;
+use std::path::Path;
+use std::str::FromStr;
 
 const DEFAULT_LOG_LEVEL: fn() -> String = || LevelFilter::Warn.to_string();
 
@@ -421,7 +423,8 @@ pub mod tests {
     use super::*;
     use crate::test_utils::TEST_CONFIG_PATH;
     use rand::random;
-    use std::{path::Path, string::String};
+    use std::path::Path;
+    use std::string::String;
 
     #[test]
     fn test_read_config_from_file() {

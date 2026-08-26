@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::LazyLock;
 use std::time::Duration;
 
 use tokio::time::Instant;
